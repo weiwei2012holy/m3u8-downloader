@@ -8,8 +8,12 @@ import (
     "bytes"
     "crypto/aes"
     "crypto/cipher"
+    "errors"
     "flag"
     "fmt"
+    "github.com/levigross/grequests"
+    "github.com/yapingcat/gomedia/mp4"
+    "github.com/yapingcat/gomedia/mpeg2"
     "io/ioutil"
     "log"
     "net/url"
@@ -21,17 +25,18 @@ import (
     "strings"
     "sync"
     "time"
-
-    "github.com/levigross/grequests"
 )
 
 const (
-    // HEAD_TIMEOUT 请求头超时时间
-    HEAD_TIMEOUT = 10 * time.Second
-    // PROGRESS_WIDTH 进度条长度
-    PROGRESS_WIDTH = 20
-    // TS_NAME_TEMPLATE ts视频片段命名规则
-    TS_NAME_TEMPLATE = "%05d.ts"
+    // HeadTimeout 请求头超时时间
+    HeadTimeout = 10 * time.Second
+    // ProgressWidth 进度条长度
+    ProgressWidth = 20
+    // TsNameTemplate ts视频片段命名规则
+    TsNameTemplate = "%05d.ts"
+
+    TempTsFileName   = "merge.tmp"
+    TransTmpFileName = "merge.mp4"
 )
 
 type InputArguments struct {
@@ -58,7 +63,7 @@ var (
     logger *log.Logger
     ro     = &grequests.RequestOptions{
         UserAgent:      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
-        RequestTimeout: HEAD_TIMEOUT,
+        RequestTimeout: HeadTimeout,
         Headers: map[string]string{
             "Connection":      "keep-alive",
             "Accept":          "*/*",
@@ -93,7 +98,7 @@ func RunLogic(inputArguments InputArguments) {
         flag.Usage()
         return
     }
-    var download_dir string
+    var downloadDir string
     pwd, _ := os.Getwd()
     if savePath != "" {
         if strings.HasPrefix(savePath, "/") {
@@ -103,37 +108,109 @@ func RunLogic(inputArguments InputArguments) {
         }
     }
     //pwd = "/Users/chao/Desktop" //自定义地址
-    download_dir = filepath.Join(pwd, movieDir)
-    if isExist, _ := pathExists(download_dir); !isExist {
-        os.MkdirAll(download_dir, os.ModePerm)
+    downloadDir = filepath.Join(pwd, movieDir)
+    if isExist, _ := pathExists(downloadDir); !isExist {
+        os.MkdirAll(downloadDir, os.ModePerm)
     }
     m3u8Host := getHost(m3u8Url, hostType)
     m3u8Body := getM3u8Body(m3u8Url)
     //m3u8Body := getFromFile()
-    ts_key := getM3u8Key(m3u8Host, m3u8Body)
-    if ts_key != "" {
-        fmt.Printf("待解密 ts 文件 key : %s \n", ts_key)
+    tsKey := getM3u8Key(m3u8Host, m3u8Body)
+    if tsKey != "" {
+        fmt.Printf("待解密 ts 文件 key : %s \n", tsKey)
     }
-    ts_list := getTsList(m3u8Host, m3u8Body)
-    fmt.Println("待下载 ts 文件数量:", len(ts_list))
+    tsList := getTsList(m3u8Host, m3u8Body)
+
+    fmt.Println("待下载 ts 文件数量:", len(tsList))
     // 下载ts
-    downloader(ts_list, maxGoroutines, download_dir, ts_key)
-    if ok := checkTsDownDir(download_dir); !ok {
+    downloader(tsList, maxGoroutines, downloadDir, tsKey)
+
+    if ok := checkTsDownDir(downloadDir); !ok {
         fmt.Printf("\n[Failed] 请检查url地址有效性 \n")
         return
     }
-    switch runtime.GOOS {
-    case "windows":
-        win_merge_file(download_dir)
-    default:
-        unix_merge_file(download_dir)
+
+    err := videMergeToMp4(tsList, downloadDir, movieDir)
+    if err != nil {
+        log.Fatal("格式转换失败", err)
     }
 
-    err := os.Rename(filepath.Join(download_dir, "merge.mp4"), download_dir+".mp4")
-    fmt.Println("重命名失败:", err)
-    os.RemoveAll(download_dir)
-    DrawProgressBar("Merging", float32(1), PROGRESS_WIDTH, "merge.ts")
-    fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", download_dir+".mp4", time.Now().Sub(now).Seconds())
+    //err = os.Rename(filepath.Join(downloadDir, "merge.mp4"), downloadDir+".mp4")
+    //if err != nil {
+    //    log.Fatal("重命名失败:", err)
+    //}
+    err = os.RemoveAll(downloadDir)
+    if err != nil {
+        log.Fatal("删除下载文件失败:", err)
+    }
+    fmt.Printf("\n[Success] 下载保存路径：%s | 共耗时: %6.2fs\n", downloadDir+".mp4", time.Now().Sub(now).Seconds())
+}
+
+func videMergeToMp4(tsList []TsInfo, path, fileName string) error {
+    if fileName == "" {
+        fileName = TransTmpFileName
+    }
+    fileName += ".mp4"
+
+    err := os.Chdir(path)
+    if err != nil {
+        return err
+    }
+
+    mp4file, err := os.OpenFile("../"+fileName, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0666)
+    if err != nil {
+        return err
+    }
+    defer mp4file.Close()
+
+    muxer := mp4.CreateMp4Muxer(mp4file)
+
+    vtid := muxer.AddVideoTrack(mp4.MP4_CODEC_H264)
+    atid := muxer.AddAudioTrack(mp4.MP4_CODEC_AAC, 0, 16, 44100)
+    demuxer := mpeg2.NewTSDemuxer()
+    var OnFrameErr error
+    demuxer.OnFrame = func(cid mpeg2.TS_STREAM_TYPE, frame []byte, pts uint64, dts uint64) {
+        if OnFrameErr != nil {
+            return
+        }
+        if cid == mpeg2.TS_STREAM_AAC {
+            OnFrameErr = muxer.Write(atid, frame, pts, dts)
+        } else if cid == mpeg2.TS_STREAM_H264 {
+            OnFrameErr = muxer.Write(vtid, frame, pts, dts)
+        } else {
+            OnFrameErr = errors.New("unknown cid " + strconv.Itoa(int(cid)))
+        }
+    }
+
+    for i, ts := range tsList {
+        buf, err := ioutil.ReadFile(ts.Name)
+        if err != nil {
+            return err
+        }
+        err = demuxer.Input(bytes.NewReader(buf))
+        if err != nil {
+            return err
+        }
+        if OnFrameErr != nil {
+            return OnFrameErr
+        }
+
+        DrawProgressBar("转换中", float32(i+1)/float32(len(tsList)), ProgressWidth, ts.Name)
+
+    }
+
+    err = muxer.WriteTrailer()
+    if err != nil {
+        return err
+    }
+    err = mp4file.Sync()
+    if err != nil {
+        return err
+    }
+
+    execUnixShell("rm -rf *.ts")
+
+    return nil
 }
 
 // 获取m3u8地址的host
@@ -188,13 +265,13 @@ func getTsList(host, body string) (tsList []TsInfo) {
             index++
             if strings.HasPrefix(line, "http") {
                 ts = TsInfo{
-                    Name: fmt.Sprintf(TS_NAME_TEMPLATE, index),
+                    Name: fmt.Sprintf(TsNameTemplate, index),
                     Url:  line,
                 }
                 tsList = append(tsList, ts)
             } else {
                 ts = TsInfo{
-                    Name: fmt.Sprintf(TS_NAME_TEMPLATE, index),
+                    Name: fmt.Sprintf(TsNameTemplate, index),
                     Url:  fmt.Sprintf("%s/%s", host, line),
                 }
                 tsList = append(tsList, ts)
@@ -286,7 +363,7 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
             }()
             downloadTsFile(ts, downloadDir, key, retryies)
             downloadCount++
-            DrawProgressBar("Downloading", float32(downloadCount)/float32(tsLen), PROGRESS_WIDTH, ts.Name)
+            DrawProgressBar("Downloading", float32(downloadCount)/float32(tsLen), ProgressWidth, ts.Name)
             return
         }(ts, downloadDir, key, retry)
     }
@@ -294,7 +371,7 @@ func downloader(tsList []TsInfo, maxGoroutines int, downloadDir string, key stri
 }
 
 func checkTsDownDir(dir string) bool {
-    if isExist, _ := pathExists(filepath.Join(dir, fmt.Sprintf(TS_NAME_TEMPLATE, 0))); !isExist {
+    if isExist, _ := pathExists(filepath.Join(dir, fmt.Sprintf(TsNameTemplate, 0))); !isExist {
         return true
     }
     return false
@@ -348,19 +425,33 @@ func execWinShell(s string) error {
 // windows 合并文件
 func win_merge_file(path string) {
     os.Chdir(path)
-    execWinShell("copy /b *.ts merge.tmp")
+    execWinShell(fmt.Sprintf("copy /b *.ts %s", TempTsFileName))
     execWinShell("del /Q *.ts")
-    os.Rename("merge.tmp", "merge.mp4")
+    videTrans(TempTsFileName, TransTmpFileName)
 }
 
 // unix 合并文件
 func unix_merge_file(path string) {
     os.Chdir(path)
     //cmd := `ls  *.ts |sort -t "\." -k 1 -n |awk '{print $0}' |xargs -n 1 -I {} bash -c "cat {} >> new.tmp"`
-    cmd := `cat *.ts >> merge.tmp`
+    cmd := fmt.Sprintf(`cat *.ts >> %s`, TempTsFileName)
     execUnixShell(cmd)
     execUnixShell("rm -rf *.ts")
-    os.Rename("merge.tmp", "merge.mp4")
+
+    //格式转换
+    videTrans(TempTsFileName, TransTmpFileName)
+}
+
+func videTrans(input, outPut string) {
+    //ffmpeg 是否安装
+    //cmd := fmt.Sprintf(`ffmpeg -i %s %s`, TempTsFileName, TransTmpFileName)
+    //fmt.Println(cmd)
+    //execUnixShell(cmd)
+
+    err := os.Rename(input, outPut)
+    if err != nil {
+        log.Fatal("格式转换失败", err)
+    }
 }
 
 // ============================== 加解密相关 ==============================
