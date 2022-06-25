@@ -332,13 +332,13 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
     }()
     curr_path := fmt.Sprintf("%s/%s", download_dir, ts.Name)
     if isExist, _ := pathExists(curr_path); isExist {
-        logger.Println("[warn] File: " + ts.Name + "already exist")
+        //logger.Println("[warn] File: " + ts.Name + "already exist")
         return
     }
     res, err := grequests.Get(ts.Url, ro)
 
     if res.StatusCode != 200 {
-        log.Fatal(fmt.Sprintf("下载TS失败[%d][%s]", res.StatusCode, ts.Url))
+        log.Println(fmt.Sprintf("下载TS失败[%d][%s]", res.StatusCode, ts.Url))
     }
     if err != nil || !res.Ok {
         if retries > 0 {
