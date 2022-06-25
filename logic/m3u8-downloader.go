@@ -8,6 +8,7 @@ import (
     "bytes"
     "crypto/aes"
     "crypto/cipher"
+    "encoding/json"
     "errors"
     "flag"
     "fmt"
@@ -20,6 +21,7 @@ import (
     "os"
     "os/exec"
     "path/filepath"
+    "reflect"
     "runtime"
     "strconv"
     "strings"
@@ -40,13 +42,13 @@ const (
 )
 
 type InputArguments struct {
-    FlagUrl *string
-    FlagN   *int
-    FlagHT  *string
-    FlagO   *string
-    FlagC   *string
-    FlagS   *int
-    FlagSP  *string
+    FlagUrl *string //下载地址
+    FlagN   *int    //下载线程数(max goroutines num)
+    FlagHT  *string //设置getHost的方式
+    FlagO   *string //自定义文件名(默认为movie)
+    FlagC   *string //自定义请求 cookie
+    FlagS   *int    //是否允许不安全的请求(默认为0)
+    FlagSP  *string //文件保存路径(默认为当前路径)
 }
 
 // TsInfo 用于保存 ts 文件的下载地址和文件名
@@ -74,19 +76,44 @@ var (
 )
 
 func RunLogic(inputArguments InputArguments) {
+
+    fmt.Println(inputArguments)
     msgTpl := "[功能]:多线程下载直播流 m3u8 视屏（ts + 合并）\n[提醒]:如果下载失败，请使用 -ht=apiv2 \n[提醒]:如果下载失败，m3u8 地址可能存在嵌套\n[提醒]:如果进度条中途下载失败，可重复执行"
     fmt.Println(msgTpl)
     runtime.GOMAXPROCS(runtime.NumCPU())
     now := time.Now()
     m3u8Url := *inputArguments.FlagUrl
-    maxGoroutines := *inputArguments.FlagN
-    hostType := *inputArguments.FlagHT
-    movieDir := *inputArguments.FlagO
-    cookie := *inputArguments.FlagC
-    insecure := *inputArguments.FlagS
-    savePath := *inputArguments.FlagSP
 
-    ro.Headers["Referer"] = getHost(m3u8Url, "apiv2")
+    maxGoroutines := 16
+    if inputArguments.FlagN != nil {
+        maxGoroutines = *inputArguments.FlagN
+    }
+    hostType := "apiv2"
+    if inputArguments.FlagHT != nil {
+        hostType = *inputArguments.FlagHT
+    }
+
+    movieDir := "movie"
+    if inputArguments.FlagO != nil {
+        movieDir = *inputArguments.FlagO
+
+    }
+
+    var cookie string
+    if inputArguments.FlagC != nil {
+        cookie = *inputArguments.FlagC
+    }
+
+    var insecure int
+    if inputArguments.FlagS != nil {
+        insecure = *inputArguments.FlagS
+    }
+    var savePath string
+    if inputArguments.FlagSP != nil {
+        savePath = *inputArguments.FlagSP
+    }
+
+    ro.Headers["Referer"] = getHost(m3u8Url, hostType)
     if insecure != 0 {
         ro.InsecureSkipVerify = true
     }
@@ -119,6 +146,7 @@ func RunLogic(inputArguments InputArguments) {
     if tsKey != "" {
         fmt.Printf("待解密 ts 文件 key : %s \n", tsKey)
     }
+
     tsList := getTsList(m3u8Host, m3u8Body)
 
     fmt.Println("待下载 ts 文件数量:", len(tsList))
@@ -129,10 +157,11 @@ func RunLogic(inputArguments InputArguments) {
         fmt.Printf("\n[Failed] 请检查url地址有效性 \n")
         return
     }
+    fmt.Printf("\n[Success] 下载TS文件完成 | 共耗时: %6.2fs\n", time.Now().Sub(now).Seconds())
 
     err := videMergeToMp4(tsList, downloadDir, movieDir)
     if err != nil {
-        log.Fatal("格式转换失败", err)
+        log.Fatal("videMergeToMp4 失败", err)
     }
 
     //err = os.Rename(filepath.Join(downloadDir, "merge.mp4"), downloadDir+".mp4")
@@ -216,11 +245,17 @@ func videMergeToMp4(tsList []TsInfo, path, fileName string) error {
 // 获取m3u8地址的host
 func getHost(Url, ht string) (host string) {
     u, err := url.Parse(Url)
+
     checkErr(err)
     switch ht {
     case "apiv1":
         host = u.Scheme + "://" + u.Host + filepath.Dir(u.EscapedPath())
     case "apiv2":
+        host = u.Scheme + "://" + u.Host
+    case "apiv3":
+        idx := strings.LastIndex(u.Path, "/")
+        h := u.Path[0:idx]
+        u.Host += h
         host = u.Scheme + "://" + u.Host
     }
     return
@@ -297,10 +332,14 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
     }()
     curr_path := fmt.Sprintf("%s/%s", download_dir, ts.Name)
     if isExist, _ := pathExists(curr_path); isExist {
-        //logger.Println("[warn] File: " + ts.Name + "already exist")
+        logger.Println("[warn] File: " + ts.Name + "already exist")
         return
     }
     res, err := grequests.Get(ts.Url, ro)
+
+    if res.StatusCode != 200 {
+        log.Fatal(fmt.Sprintf("下载TS失败[%d][%s]", res.StatusCode, ts.Url))
+    }
     if err != nil || !res.Ok {
         if retries > 0 {
             downloadTsFile(ts, download_dir, key, retries-1)
@@ -319,7 +358,7 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
         contentLen, _ = strconv.Atoi(contentLenStr)
     }
     if len(origData) == 0 || (contentLen > 0 && len(origData) < contentLen) || res.Error != nil {
-        //logger.Println("[warn] File: " + ts.Name + "res origData invalid or err：", res.Error)
+        //logger.Println("[warn] File: "+ts.Name+"res origData invalid or err：", res.Error)
         downloadTsFile(ts, download_dir, key, retries-1)
         return
     }
@@ -343,7 +382,10 @@ func downloadTsFile(ts TsInfo, download_dir, key string, retries int) {
             break
         }
     }
-    ioutil.WriteFile(curr_path, origData, 0666)
+    err = ioutil.WriteFile(curr_path, origData, 0666)
+    if err != nil {
+        fmt.Println("ioutil.WriteFile 失败", err)
+    }
 }
 
 // downloader m3u8 下载器
@@ -510,4 +552,32 @@ func checkErr(e error) {
     if e != nil {
         logger.Panic(e)
     }
+}
+
+//Dump 打印数据结构
+func Dump(items ...interface{}) {
+
+    for i, item := range items {
+        index := i + 1
+        fmt.Printf("\n<=打印第 %d 个变量=>\n\n", index)
+
+        if item == nil {
+            fmt.Println("ERROR: nil pointer")
+            continue
+        }
+        typeName := reflect.TypeOf(item).Kind()
+        switch typeName {
+        //复杂结构尝试打印结构
+        case reflect.Ptr, reflect.Interface, reflect.Slice, reflect.Func, reflect.Struct, reflect.Array, reflect.Map:
+            r, err := json.MarshalIndent(item, "", "\t")
+            if err != nil {
+                fmt.Printf("%#v \n", item)
+            } else {
+                fmt.Println(string(r))
+            }
+        default:
+            fmt.Printf("%#v \n", item)
+        }
+    }
+
 }
